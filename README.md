@@ -51,10 +51,10 @@ docker compose --profile acceptance up --build --exit-code-from verify verify
 `verify` 服务依次执行（任一步失败即整体失败，退出码非 0）：
 
 1. 检查 `web → api` 反向代理链路与健康检查；
-2. **pytest**：20 并发无重号无缺号、重复提交幂等、409 冲突、**进程重启后映射与计数恢复**、故障注入后重试取回原号码、**旧库迁移与幂等重放、备注修订三方合并/冲突**（其中 `test_live_service.py` 直接打向 compose 中运行的 `api` 服务）；
+2. **pytest**：20 并发无重号无缺号、重复提交幂等、409 冲突、**进程重启后映射与计数恢复**、故障注入后重试取回原号码、**旧库迁移与幂等重放、备注修订三方合并/冲突/重基模板与未重基草稿拒绝**（其中 `test_live_service.py` 直接打向 compose 中运行的 `api` 服务）；
 3. **Vitest**：前端待重试保留、本地持久化、重试幂等键不变、409 反馈，以及备注草稿状态机与看板修订号归并等逻辑。
 
-浏览器端到端（Playwright，本地 `cd web && npm run e2e`）额外覆盖：行内修订、两终端不相交自动合并、重叠冲突解决、断网重试。
+浏览器端到端（Playwright，本地 `cd web && npm run e2e`）额外覆盖：行内修订、两终端不相交自动合并、重叠冲突解决、**409 后未重基草稿被拒绝并重基保留远端非冲突改动**、断网重试。
 
 ## 幂等协议与事务边界
 
@@ -119,8 +119,9 @@ PATCH /api/operations/{client_op_id}/notes
 ```
 
 - 基础修订号 == 服务端当前修订号：正常保存为下一个修订（`merge_status: "updated"`）；
-- 基础修订号落后（其他终端已保存）：服务端以基础版本为共同祖先，对本终端文本与服务端当前文本做**确定性的按行三方合并**——不相交改动自动合并，且只产生一个新修订（`merge_status: "merged"`）；改动重叠则返回 `409`，响应体含每个冲突区域的三方片段（`base` / `mine` / `theirs`）与服务端当前行，**数据库保持原样**；
-- 场记对照三方片段在本地整理文本后，以服务端当前修订号为新基础再次保存即可；
+- 基础修订号落后（其他终端已保存）：服务端以基础版本为共同祖先，对本终端文本与服务端当前文本做**确定性的按行三方合并**——不相交改动自动合并，且只产生一个新修订（`merge_status: "merged"`）；改动重叠则返回 `409`，响应体含每个冲突区域的三方片段（`base` / `mine` / `theirs`）、服务端当前行以及一份**重基模板 `rebase_template`**，**数据库保持原样**；
+- 场记对照三方片段在**重基模板**上整理文本后再次保存即可。重基模板已包含其他终端的所有**非冲突**改动，冲突区预填本终端原文，因此不会丢任何输入；
+- **防覆盖保证**：冲突解决保存需额外回传被拒编辑的真实来源（`resolution_base_revision` + `conflict_notes`）。服务端据此校验草稿确实重基到了服务端全文：若草稿缺少其他终端已提交的非冲突改动（只推进了 `base_revision` 却提交旧草稿），返回 `409 notes_unrebased`、附带新的重基模板，**数据库不动**，绝不会静默还原远端改动；
 - 保存响应丢失（网络失败/超时）后用**相同基础修订号与文本**重试是安全的：合并出的文本与当前一致时不会重复产生修订号。
 
 前端场次看板行内维护 `只读 / 编辑中 / 保存中 / 冲突` 一组草稿状态：网络失败或冲突都保留已输入文本；看板轮询按操作标识归并且修订号只升不降，较早的轮询响应即使晚到也不会覆盖新修订。
@@ -134,7 +135,7 @@ PATCH /api/operations/{client_op_id}/notes
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/shot-numbers` | 领取镜号。新操作返回 `201`，幂等重放返回 `200`（`replayed: true`），内容冲突返回 `409`，注入故障返回 `503` |
-| `PATCH` | `/api/operations/{client_op_id}/notes` | 行内修订备注。请求体 `{client_op_id, base_revision, notes}`；正常 `updated`、落后且不相交 `merged`（均 200），重叠冲突返回带三方片段的 `409` |
+| `PATCH` | `/api/operations/{client_op_id}/notes` | 行内修订备注。请求体 `{client_op_id, base_revision, notes, resolution_base_revision?, conflict_notes?}`；正常 `updated`、落后且不相交 `merged`（均 200），重叠冲突返回带三方片段与 `rebase_template` 的 `409 notes_conflict`，未重基解决草稿返回带新模板的 `409 notes_unrebased` |
 | `GET` | `/api/operations/{client_op_id}/note-revisions` | 备注修订历史（修订号升序，`0` 为发放备注） |
 | `GET` | `/api/scenes/{scene_id}/operations` | 场次已发放镜号列表（按号码升序，含当前备注与修订号） |
 | `GET` | `/api/operations/{client_op_id}` | 按操作标识查询（不存在返回 `404`） |
@@ -184,7 +185,7 @@ cd web && npx playwright install chromium && npm run e2e
 │   └── app/
 │       ├── main.py         # 路由、409/503 语义、备注修订接口、故障注入开关
 │       ├── storage.py      # 事务边界：BEGIN IMMEDIATE … COMMIT；旧库自动迁移（见文件头注释）
-│       └── merge.py        # 确定性按行三方合并（不相交自动合并，重叠产出三方片段）
+│       └── merge.py        # 确定性按行三方合并（相邻改动行独立、不相交自动合并，重叠产出三方片段；冲突重基模板与未重基草稿校验）
 ├── tests/                  # pytest：并发、重启、故障注入、迁移/重放、三方合并、live 服务验收
 ├── verify/                 # 一次性验收服务（Dockerfile + run.sh）
 └── web/                    # React + TypeScript 前端

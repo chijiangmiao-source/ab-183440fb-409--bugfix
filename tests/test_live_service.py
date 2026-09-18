@@ -31,6 +31,58 @@ def test_live_health():
     assert resp.json()["status"] == "ok"
 
 
+def test_live_conflict_rebase_keeps_remote_non_conflicting_edit():
+    """409 后的防覆盖现场：二次保存未重基草稿必须被拒绝，真正重基后远端
+    非冲突改动才保留（场景/标识每次唯一，对持久库安全）。"""
+    scene = _scene()
+    issued = httpx.post(
+        f"{BASE_URL}/api/shot-numbers",
+        json={"scene_id": scene, "client_op_id": uuid.uuid4().hex,
+              "notes": "第一行\n第二行\n第三行"},
+        timeout=10.0,
+    )
+    assert issued.status_code == 201
+    op_id = issued.json()["client_op_id"]
+
+    def patch(base_revision, notes, **extra):
+        payload = {"client_op_id": op_id, "base_revision": base_revision,
+                   "notes": notes, **extra}
+        return httpx.patch(
+            f"{BASE_URL}/api/operations/{op_id}/notes",
+            json=payload, timeout=10.0,
+        )
+
+    # B 一次保存同时改第二行（重叠）与第三行（不相交），成为 r1。
+    assert patch(0, "第一行\nB第二行\nB第三行").status_code == 200
+
+    # A 基于 r0 只改第二行 -> 409，且拿到只含第二行冲突片段与重基模板。
+    clash = patch(0, "第一行\nA第二行\n第三行")
+    assert clash.status_code == 409
+    detail = clash.json()["detail"]
+    assert detail["error"] == "notes_conflict"
+    assert [c["base"] for c in detail["conflicts"]] == ["第二行\n"]
+    assert detail["rebase_template"] == "第一行\nA第二行\nB第三行"
+
+    # A 只整理第二行、第三行仍保留旧草稿 r0 文本就再次保存：必须被拒，
+    # 数据库仍是 r1，B 的第三行改动不被还原。
+    bad = patch(1, "第一行\nA+B第二行\n第三行",
+                resolution_base_revision=0,
+                conflict_notes="第一行\nA第二行\n第三行")
+    assert bad.status_code == 409
+    assert bad.json()["detail"]["error"] == "notes_unrebased"
+    current = httpx.get(f"{BASE_URL}/api/operations/{op_id}", timeout=10.0).json()
+    assert current["notes_revision"] == 1
+    assert current["notes"] == "第一行\nB第二行\nB第三行"
+
+    # A 在重基模板上整理第二行（第三行沿用 B 的改动）后保存 -> r2。
+    ok = patch(1, "第一行\nA+B第二行\nB第三行",
+               resolution_base_revision=0,
+               conflict_notes="第一行\nA第二行\n第三行")
+    assert ok.status_code == 200
+    assert ok.json()["notes_revision"] == 2
+    assert ok.json()["notes"] == "第一行\nA+B第二行\nB第三行"
+
+
 def test_live_twenty_concurrent_operations_are_gapless():
     scene = _scene()
     op_ids = [uuid.uuid4().hex for _ in range(20)]

@@ -139,6 +139,74 @@ test('重叠编辑返回 409：展示三方片段、输入保留，整理后再�
   await expect(panel).toHaveCount(0);
 });
 
+test('409 后未重基旧草稿二次保存被拒绝，重基模板保留远端非冲突改动', async ({
+  page,
+  request,
+}) => {
+  // 复现报告：B 一次保存同时改重叠的第二行与不重叠的第三行；A 收到第二行
+  // 冲突的 409 后只整理第二行、保留旧草稿第三行再次保存——绝不能把 B 的第三
+  // 行改动静默还原。
+  await page.goto('/');
+  await issueShot(page, 'E2E-NOTES-UNREBASED', '第一行\n第二行\n第三行');
+
+  const row = page.getByTestId('scene-op-row').first();
+  await row.getByTestId('edit-notes-button').click();
+  await row
+    .getByTestId('notes-draft-input')
+    .fill('第一行\nA第二行\n第三行');
+
+  const listing = await request.get('/api/scenes/E2E-NOTES-UNREBASED/operations');
+  const ops = (await listing.json()) as Array<{ client_op_id: string }>;
+  const opId = ops[0].client_op_id;
+
+  // B 先保存：同一次保存里同时改第二行（与 A 重叠）与第三行（不相交）。
+  const bResp = await request.patch(`/api/operations/${opId}/notes`, {
+    data: {
+      client_op_id: opId,
+      base_revision: 0,
+      notes: '第一行\nB第二行\nB第三行',
+    },
+  });
+  expect(bResp.status()).toBe(200);
+
+  // A 保存 -> 冲突面板；冲突只在第二行。
+  await row.getByTestId('save-notes-button').click();
+  const panel = row.getByTestId('notes-conflict-panel');
+  await expect(panel).toBeVisible();
+  await expect(panel.getByTestId('conflict-base')).toContainText('第二行');
+
+  // 关键：输入框自动载入“重基模板”，已含 B 的非冲突第三行改动，且冲突的
+  // 第二行保留 A 原文——不再是缺 B第三行的旧草稿。
+  const draft = row.getByTestId('notes-draft-input');
+  await expect(draft).toHaveValue('第一行\nA第二行\nB第三行');
+  await expect(row).toContainText('基础修订号 r1');
+
+  // 模拟复现中的错误操作：只把第二行整理好，第三行却改回 r0 旧文本。
+  await draft.fill('第一行\nA+B第二行\n第三行');
+  await row.getByTestId('save-notes-button').click();
+
+  // 服务端识别为“未重基”并拒绝：错误可见、仍停留冲突面板、数据库不动（r1）。
+  await expect(row.getByTestId('notes-save-error')).toContainText('未重基');
+  await expect(panel).toBeVisible();
+  // 编辑器仍停留在以服务端 r1 为基础的冲突态，未产生新修订。
+  await expect(row).toContainText('基础修订号 r1');
+  const afterReject = await request.get(`/api/operations/${opId}`);
+  expect((await afterReject.json()).notes).toBe('第一行\nB第二行\nB第三行');
+
+  // 一键重新载入重基模板，只整理冲突的第二行，第三行沿用 B 的改动。
+  await row.getByTestId('use-rebase-template-button').click();
+  await expect(draft).toHaveValue('第一行\nA第二行\nB第三行');
+  await draft.fill('第一行\nA+B第二行\nB第三行');
+  await row.getByTestId('save-notes-button').click();
+
+  // 成功成为 r2：第二行是双方整理结果，B 的第三行非冲突改动完整保留。
+  await expect(row.getByTestId('notes-revision')).toHaveText('r2');
+  await expect(row).toContainText('A+B第二行');
+  await expect(row).toContainText('B第三行');
+  const finalOp = await request.get(`/api/operations/${opId}`);
+  expect((await finalOp.json()).notes).toBe('第一行\nA+B第二行\nB第三行');
+});
+
 test('保存时网络失败保留输入，恢复后重试成功', async ({ page }) => {
   await page.goto('/');
   await issueShot(page, 'E2E-NOTES-NET', '网络测试原备注');

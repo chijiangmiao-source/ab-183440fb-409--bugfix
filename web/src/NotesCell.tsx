@@ -14,6 +14,7 @@ import {
   saveRetryable,
   saveSucceeded,
   startDraft,
+  useRebaseTemplate,
   useServerText,
   type NoteDraftState,
 } from './lib/noteDraft';
@@ -81,13 +82,22 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
         client_op_id: op.client_op_id,
         base_revision: draft.baseRevision,
         notes: draft.draft,
+        // 冲突解决保存：回传被拒编辑的真实来源，服务端据此校验草稿确实
+        // 重基到服务端全文（包含其他终端的非冲突改动）。
+        ...(draft.resolutionBaseRevision !== null &&
+        draft.conflictNotes !== null
+          ? {
+              resolution_base_revision: draft.resolutionBaseRevision,
+              conflict_notes: draft.conflictNotes,
+            }
+          : {}),
       });
       onSaved(res, res.merge_status === 'merged');
       setDraft(saveSucceeded());
     } catch (err) {
       if (err instanceof NotesConflictError) {
-        // 重叠改动：输入原样保留，基础修订号推进到服务端当前版本，
-        // 场记对照三方片段整理后再次保存。
+        // 重叠改动或未重基草稿：输入保留，基础修订号推进到服务端当前版本，
+        // 场记对照三方片段/重基模板整理后再次保存。
         setDraft((state) =>
           saveNotesConflict(
             state,
@@ -99,6 +109,8 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
                     notes_revision: err.current.notes_revision,
                   }
                 : null,
+              rebaseTemplate: err.rebaseTemplate,
+              unrebased: err.unrebased,
             },
             err.message,
           ),
@@ -233,8 +245,11 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
       {inConflict && (
         <div className="notes-conflict" data-testid="notes-conflict-panel">
           <p className="error-text">
-            与其他终端的修改在同一区域冲突，数据库未改动。请对照以下三方片段，在上方输入框
-            整理出最终文本后再次保存（将以服务端 r{draft.baseRevision} 为基础）。
+            与其他终端的修改在同一区域冲突，数据库未改动。输入框已载入服务端给出的
+            <strong>重基模板</strong>：其中已保留其他终端的非冲突改动，冲突区域保留
+            本终端原文。请对照三方片段，只在模板上整理冲突区域后再次保存（将以服务端
+            r{draft.baseRevision} 为基础）。切勿直接提交未重基的旧草稿，否则会还原
+            其他终端的非冲突改动。
           </p>
           {draft.conflictSegments.map((segment, idx) => (
             <div className="conflict-segments" key={idx} data-testid="conflict-segment">
@@ -252,6 +267,16 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
               </div>
             </div>
           ))}
+          {draft.rebaseTemplate !== null && (
+            <button
+              type="button"
+              className="ghost"
+              data-testid="use-rebase-template-button"
+              onClick={() => setDraft((state) => useRebaseTemplate(state))}
+            >
+              重新载入重基模板（含远端非冲突改动）
+            </button>
+          )}
           {draft.serverNotes !== null && (
             <button
               type="button"
@@ -259,7 +284,7 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
               data-testid="use-server-notes-button"
               onClick={() => setDraft((state) => useServerText(state))}
             >
-              先填入服务端文本再整理
+              先填入服务端全文再整理
             </button>
           )}
         </div>

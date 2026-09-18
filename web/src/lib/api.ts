@@ -20,14 +20,20 @@ export class ConflictError extends Error {
 }
 
 /**
- * 409：备注修订与其他终端的改动重叠。携带服务端当前备注、修订号与三方片段，
- * 场记整理文本后用新的基础修订号再次保存即可；输入不会因此丢失。
+ * 409：备注修订与其他终端的改动重叠。携带服务端当前备注、修订号、三方片段以及
+ * 一份“已重基模板”（已含远端非冲突改动、冲突区保留本终端原文）；场记应在该
+ * 模板上整理文本后再次保存，输入不会因此丢失。
+ *
+ * unrebased=true 表示本次保存的草稿根本没有重基（缺少远端非冲突改动），
+ * 服务端已拒绝且数据库未改动；此时应直接采用 rebaseTemplate 重新整理。
  */
 export class NotesConflictError extends Error {
   readonly current: IssuedOperation | null;
   readonly baseRevision: number | null;
   readonly conflicts: ThreeWaySegment[];
   readonly serverNotes: string | null;
+  readonly rebaseTemplate: string | null;
+  readonly unrebased: boolean;
 
   constructor(
     message: string,
@@ -35,6 +41,8 @@ export class NotesConflictError extends Error {
     conflicts: ThreeWaySegment[],
     baseRevision: number | null,
     serverNotes: string | null,
+    rebaseTemplate: string | null,
+    unrebased = false,
   ) {
     super(message);
     this.name = 'NotesConflictError';
@@ -42,6 +50,8 @@ export class NotesConflictError extends Error {
     this.conflicts = conflicts;
     this.baseRevision = baseRevision;
     this.serverNotes = serverNotes;
+    this.rebaseTemplate = rebaseTemplate;
+    this.unrebased = unrebased;
   }
 }
 
@@ -84,6 +94,8 @@ interface ErrorDetail {
   conflicts?: ThreeWaySegment[];
   base_revision?: number;
   server_notes?: string;
+  rebase_template?: string;
+  error?: string;
 }
 
 async function parseErrorBody(res: Response): Promise<ErrorDetail> {
@@ -99,6 +111,9 @@ async function parseErrorBody(res: Response): Promise<ErrorDetail> {
         conflicts: Array.isArray(detail.conflicts) ? detail.conflicts : [],
         base_revision: typeof detail.base_revision === 'number' ? detail.base_revision : null,
         server_notes: typeof detail.server_notes === 'string' ? detail.server_notes : null,
+        rebase_template:
+          typeof detail.rebase_template === 'string' ? detail.rebase_template : null,
+        error: typeof detail.error === 'string' ? detail.error : undefined,
       };
     }
     if (Array.isArray(detail) && detail.length > 0) {
@@ -187,6 +202,8 @@ export function createHttpApi(baseUrl = ''): ShotNumberApi {
           detail.conflicts ?? [],
           detail.base_revision ?? null,
           detail.server_notes ?? null,
+          detail.rebase_template ?? null,
+          detail.error === 'notes_unrebased',
         );
       }
       if (res.status >= 500) {

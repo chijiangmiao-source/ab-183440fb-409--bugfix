@@ -54,7 +54,12 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from .merge import MergeResult, three_way_merge
+from .merge import (
+    MergeResult,
+    apply_conflict_resolution,
+    rebase_template,
+    three_way_merge,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scene_counters (
@@ -100,6 +105,11 @@ CONFLICT = "conflict"    # same client_op_id but different content
 UPDATED = "updated"      # one new revision was committed
 STALE_MERGED = "merged"  # base revision was behind; disjoint edits merged, one new revision
 NOTES_CONFLICT = "notes_conflict"  # overlapping edits: three-way fragments returned
+# A conflict-resolution save whose draft was never rebased: it is missing
+# disjoint remote edits and would silently revert them. Nothing is written.
+NOTES_UNREBASED = "notes_unrebased"
+# Malformed conflict-resolution parameters.
+NOTES_BAD_REQUEST = "notes_bad_request"
 NOT_FOUND = "not_found"
 
 
@@ -147,9 +157,14 @@ class IssueOutcome:
 
 @dataclass(frozen=True)
 class UpdateNotesOutcome:
-    status: str  # UPDATED | STALE_MERGED | NOTES_CONFLICT | NOT_FOUND
+    status: str  # UPDATED | STALE_MERGED | NOTES_CONFLICT | NOTES_UNREBASED | NOTES_BAD_REQUEST | NOT_FOUND
     operation: Optional[Operation] = None
     merge: Optional[MergeResult] = None
+    # Pre-rebased draft offered on a conflict (see merge.rebase_template).
+    rebase_template: Optional[str] = None
+    # Conflict-resolution metadata echoed on NOTES_UNREBASED / NOTES_BAD_REQUEST.
+    expected_resolution_base: Optional[int] = None
+    reported_resolution_base: Optional[int] = None
 
 
 _OPERATION_COLUMNS = (
@@ -324,7 +339,13 @@ class Storage:
                 raise
 
     def update_notes(
-        self, *, client_op_id: str, base_revision: int, notes: str
+        self,
+        *,
+        client_op_id: str,
+        base_revision: int,
+        notes: str,
+        resolution_base_revision: Optional[int] = None,
+        conflict_notes: Optional[str] = None,
     ) -> UpdateNotesOutcome:
         """Revise a shot's note with optimistic concurrency.
 
@@ -335,9 +356,22 @@ class Storage:
         * ``base_revision < current``: a deterministic three-way merge runs
           between the base note, the caller's edit and the current note.
           Disjoint edits auto-merge into one new revision; overlapping edits
-          return NOTES_CONFLICT with the three fragments and nothing changes.
+          return NOTES_CONFLICT with the three fragments *and* a pre-rebased
+          template; nothing changes.
         * ``base_revision > current`` or negative: NOTES_CONFLICT-style reject
           (the caller is against a history this server never saw).
+
+        Resolving a conflict
+        --------------------
+        A stale save that overlaps is rejected (database untouched).  The
+        client must reconcile against the server's *full* current text and
+        save with ``base_revision`` at the advertised current revision, plus
+        the original edit's provenance (``resolution_base_revision`` +
+        ``conflict_notes``).  The server then verifies (see
+        :func:`merge.apply_conflict_resolution`) that the reconciled text
+        really carries every non-conflicting remote edit; a draft that was
+        merely re-tagged with the new base revision but never rebased is
+        rejected as NOTES_UNREBASED and cannot silently revert remote work.
         """
         with self._lock:
             cur = self._conn.cursor()
@@ -358,9 +392,72 @@ class Storage:
                     cur.execute("ROLLBACK")
                     return UpdateNotesOutcome(NOTES_CONFLICT, current)
 
-                if base_revision == current.notes_revision:
+                merged = None
+                resolving = resolution_base_revision is not None
+
+                if resolving:
+                    # Conflict-resolution save: the draft claims to be a
+                    # reconciliation of an earlier edit (conflict_notes based
+                    # at resolution_base_revision) onto the server's text.
+                    if (
+                        conflict_notes is None
+                        or resolution_base_revision is None
+                        or resolution_base_revision < 0
+                        or resolution_base_revision >= current.notes_revision
+                    ):
+                        cur.execute("ROLLBACK")
+                        return UpdateNotesOutcome(
+                            NOTES_BAD_REQUEST,
+                            current,
+                            expected_resolution_base=current.notes_revision,
+                            reported_resolution_base=resolution_base_revision,
+                        )
+
+                    res_base_row = cur.execute(
+                        "SELECT notes FROM note_revisions"
+                        " WHERE client_op_id = ? AND revision = ?",
+                        (client_op_id, resolution_base_revision),
+                    ).fetchone()
+                    if res_base_row is None:
+                        # History is append-only and contiguous, so this should
+                        # be unreachable; guard regardless.
+                        cur.execute("ROLLBACK")
+                        return UpdateNotesOutcome(
+                            NOTES_BAD_REQUEST,
+                            current,
+                            expected_resolution_base=current.notes_revision,
+                            reported_resolution_base=resolution_base_revision,
+                        )
+                    res_base_text = res_base_row["notes"]
+                    theirs_text = current.notes
+                    merge_view = three_way_merge(
+                        res_base_text, conflict_notes, theirs_text
+                    )
+                    new_text = apply_conflict_resolution(
+                        res_base_text, conflict_notes, theirs_text, notes
+                    )
+                    if new_text is None:
+                        # The draft was never rebased: it is missing disjoint
+                        # edits other terminals committed.  Reject, keep the
+                        # conflict view fresh, change nothing.
+                        cur.execute("ROLLBACK")
+                        template = rebase_template(
+                            res_base_text, conflict_notes, theirs_text
+                        )
+                        return UpdateNotesOutcome(
+                            NOTES_UNREBASED,
+                            current,
+                            merge_view,
+                            template,
+                            current.notes_revision,
+                            resolution_base_revision,
+                        )
+                    if merge_view.clean:
+                        merged = None
+                    else:
+                        merged = merge_view
+                elif base_revision == current.notes_revision:
                     new_text = notes
-                    merged = None
                     if notes == current.notes:
                         # No actual change: report success without a new row.
                         cur.execute("COMMIT")
@@ -375,14 +472,20 @@ class Storage:
                     theirs_text = current.notes
                     merged = three_way_merge(base_text, notes, theirs_text)
                     if not merged.clean:
-                        # Overlapping edits: return fragments and change nothing.
+                        # Overlapping edits: return fragments and a pre-rebased
+                        # reconciliation template; change nothing.
                         cur.execute("ROLLBACK")
-                        return UpdateNotesOutcome(NOTES_CONFLICT, current, merged)
+                        template = rebase_template(base_text, notes, theirs_text)
+                        return UpdateNotesOutcome(
+                            NOTES_CONFLICT, current, merged, template
+                        )
                     new_text = merged.merged_text
-                    if new_text == current.notes:
-                        # The merge collapsed to what is already current.
-                        cur.execute("COMMIT")
-                        return UpdateNotesOutcome(STALE_MERGED, current)
+
+                if new_text == current.notes:
+                    # The merge/resolution collapsed to what is already current.
+                    cur.execute("COMMIT")
+                    status = STALE_MERGED if base_revision < current.notes_revision else UPDATED
+                    return UpdateNotesOutcome(status, current)
 
                 next_revision = current.notes_revision + 1
                 updated_at = cur.execute(
@@ -409,7 +512,17 @@ class Storage:
                     notes_fingerprint=current.notes_fingerprint,
                     notes_updated_at=updated_at,
                 )
-                status = STALE_MERGED if merged is not None else UPDATED
+                if resolving:
+                    # A resolution against the revision advertised in the 409
+                    # is a plain save; if the server advanced meanwhile, the
+                    # extra disjoint edits were merged in.
+                    status = (
+                        STALE_MERGED
+                        if base_revision < current.notes_revision
+                        else UPDATED
+                    )
+                else:
+                    status = STALE_MERGED if merged is not None else UPDATED
                 return UpdateNotesOutcome(status, updated, merged)
             except Exception:
                 cur.execute("ROLLBACK")

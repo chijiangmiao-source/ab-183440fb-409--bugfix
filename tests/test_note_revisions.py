@@ -41,15 +41,21 @@ def issue_ok(base_url: str, scene: str, notes: str = "", op_id: str | None = Non
 
 
 def patch_notes(
-    base_url: str, op_id: str, base_revision: int, notes: str
+    base_url: str, op_id: str, base_revision: int, notes: str,
+    *, resolution_base_revision: int | None = None,
+    conflict_notes: str | None = None,
 ) -> httpx.Response:
+    payload = {
+        "client_op_id": op_id,
+        "base_revision": base_revision,
+        "notes": notes,
+    }
+    if resolution_base_revision is not None:
+        payload["resolution_base_revision"] = resolution_base_revision
+        payload["conflict_notes"] = conflict_notes
     return httpx.patch(
         f"{base_url}/api/operations/{op_id}/notes",
-        json={
-            "client_op_id": op_id,
-            "base_revision": base_revision,
-            "notes": notes,
-        },
+        json=payload,
         timeout=10.0,
     )
 
@@ -249,6 +255,138 @@ def test_overlapping_edits_return_409_with_three_way_fragments_and_change_nothin
     assert resolved.status_code == 200
     assert resolved.json()["notes_revision"] == 2
     assert resolved.json()["notes"] == "开场镜头\nA+B 合并后的备注\n结尾\n"
+
+
+def test_conflict_409_offers_rebase_template_preserving_disjoint_remote_edits(
+    api_server,
+):
+    base = api_server.base_url
+    op = issue_ok(base, "REBASE-T", notes="第一行\n第二行\n第三行")
+    op_id = op["client_op_id"]
+
+    # Terminal B saves r1 in one go: it changes BOTH the overlapping line 2
+    # and the disjoint line 3.
+    assert patch_notes(
+        base, op_id, 0, "第一行\nB第二行\nB第三行"
+    ).status_code == 200
+
+    # Terminal A saves against r0, changing only line 2: line 2 conflicts,
+    # line 3 is B's disjoint edit and must survive.
+    resp = patch_notes(base, op_id, 0, "第一行\nA第二行\n第三行")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "notes_conflict"
+    # The conflict is scoped to line 2 only — line 3 never was in conflict.
+    fragments = detail["conflicts"]
+    assert [(f["base"], f["mine"], f["theirs"]) for f in fragments] == [
+        ("第二行\n", "A第二行\n", "B第二行\n")
+    ]
+    # The pre-rebased template already carries B's disjoint line-3 edit and
+    # keeps A's own conflicting line.
+    assert detail["rebase_template"] == "第一行\nA第二行\nB第三行"
+    # Database untouched, still r1.
+    current = httpx.get(f"{base}/api/operations/{op_id}", timeout=10.0).json()
+    assert current["notes_revision"] == 1
+    assert current["notes"] == "第一行\nB第二行\nB第三行"
+
+
+def test_unrebased_resolution_is_rejected_and_cannot_revert_remote_edits(api_server):
+    """The exact reported reproduction: after a 409 the client re-tags its
+    stale draft with the new base revision and saves again.  The server must
+    detect the missing disjoint remote edit and reject without writing."""
+    base = api_server.base_url
+    op = issue_ok(base, "UNREBASE", notes="第一行\n第二行\n第三行")
+    op_id = op["client_op_id"]
+
+    assert patch_notes(
+        base, op_id, 0, "第一行\nB第二行\nB第三行"
+    ).status_code == 200
+
+    # A's stale r0 edit overlaps on line 2 -> 409 with a rebase template.
+    clash = patch_notes(base, op_id, 0, "第一行\nA第二行\n第三行")
+    assert clash.status_code == 409
+    clash_detail = clash.json()["detail"]
+    assert clash_detail["current"]["notes_revision"] == 1
+
+    # A reconciles ONLY the conflicting line 2 but forgets to rebase line 3,
+    # then saves against r1 with the proper provenance.  The draft still
+    # contains r0's line 3 instead of B's committed "B第三行".
+    bad = patch_notes(
+        base,
+        op_id,
+        1,
+        "第一行\nA+B第二行\n第三行",
+        resolution_base_revision=0,
+        conflict_notes="第一行\nA第二行\n第三行",
+    )
+    assert bad.status_code == 409
+    bad_detail = bad.json()["detail"]
+    assert bad_detail["error"] == "notes_unrebased"
+    assert bad_detail["current"]["notes_revision"] == 1
+    # A fresh template is offered and B's disjoint edit is present in it.
+    assert bad_detail["rebase_template"] == "第一行\nA第二行\nB第三行"
+
+    # Nothing was written: still r1 with B's text, history has r0/r1 only.
+    current = httpx.get(f"{base}/api/operations/{op_id}", timeout=10.0).json()
+    assert current["notes_revision"] == 1
+    assert current["notes"] == "第一行\nB第二行\nB第三行"
+    assert [r["revision"] for r in revisions_of(base, op_id)] == [0, 1]
+
+    # A now resolves on the rebased template (line 3 carries B's edit) and
+    # saves: r2 keeps BOTH the reconciled line 2 and B's disjoint line 3.
+    ok = patch_notes(
+        base,
+        op_id,
+        1,
+        "第一行\nA+B第二行\nB第三行",
+        resolution_base_revision=0,
+        conflict_notes="第一行\nA第二行\n第三行",
+    )
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["notes_revision"] == 2
+    assert body["notes"] == "第一行\nA+B第二行\nB第三行"
+    assert body["shot_number"] == 1
+
+
+def test_resolution_without_provenance_against_current_revision_still_updates(
+    api_server,
+):
+    """A plain same-revision save remains a normal update even mid-conflict:
+    the reconciliation is simply the authoritative new full text."""
+    base = api_server.base_url
+    op = issue_ok(base, "PLAIN-RES", notes="第一行\n第二行\n第三行")
+    op_id = op["client_op_id"]
+    assert patch_notes(
+        base, op_id, 0, "第一行\nB第二行\nB第三行"
+    ).status_code == 200
+    assert patch_notes(base, op_id, 0, "第一行\nA第二行\n第三行").status_code == 409
+
+    # Client edits directly against the server's full current text and saves
+    # a fully reconciled document without resolution provenance.
+    ok = patch_notes(
+        base, op_id, 1, "第一行\nA+B第二行\nB第三行"
+    )
+    assert ok.status_code == 200
+    assert ok.json()["merge_status"] == "updated"
+    assert ok.json()["notes"] == "第一行\nA+B第二行\nB第三行"
+
+
+def test_resolution_fields_must_travel_together(api_server):
+    base = api_server.base_url
+    op = issue_ok(base, "BAD-RES", notes="x")
+    op_id = op["client_op_id"]
+    resp = httpx.patch(
+        f"{base}/api/operations/{op_id}/notes",
+        json={
+            "client_op_id": op_id,
+            "base_revision": 0,
+            "notes": "y",
+            "resolution_base_revision": 0,
+        },
+        timeout=10.0,
+    )
+    assert resp.status_code == 422  # pydantic validation error
 
 
 def test_identical_concurrent_updates_commit_once_and_safe_retry_doubles_nothing(

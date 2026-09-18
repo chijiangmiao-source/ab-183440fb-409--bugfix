@@ -6,12 +6,14 @@ import os
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .storage import (
     CONFLICT,
     ISSUED,
+    NOTES_BAD_REQUEST,
     NOTES_CONFLICT,
+    NOTES_UNREBASED,
     NOT_FOUND,
     REPLAYED,
     NoteRevision,
@@ -77,6 +79,12 @@ class NoteUpdateRequest(BaseModel):
     # three-way merged against the revision history.
     base_revision: int = Field(ge=0)
     notes: str = Field(default="", max_length=4000)
+    # Present only when saving a reconciliation after a 409.  They prove which
+    # edit the draft originated from, so the server can verify the draft was
+    # genuinely rebased onto the server's full current text instead of just
+    # re-tagging the stale draft with the new base revision.
+    resolution_base_revision: Optional[int] = Field(default=None, ge=0)
+    conflict_notes: Optional[str] = Field(default=None, max_length=4000)
 
     @field_validator("client_op_id")
     @classmethod
@@ -85,6 +93,14 @@ class NoteUpdateRequest(BaseModel):
         if not stripped:
             raise ValueError("must not be blank")
         return stripped
+
+    @model_validator(mode="after")
+    def _resolution_fields_travel_together(self) -> "NoteUpdateRequest":
+        if (self.resolution_base_revision is None) != (self.conflict_notes is None):
+            raise ValueError(
+                "resolution_base_revision 与 conflict_notes 必须同时提供"
+            )
+        return self
 
 
 class NoteRevisionModel(BaseModel):
@@ -208,6 +224,8 @@ def create_app(
             client_op_id=client_op_id,
             base_revision=request.base_revision,
             notes=request.notes,
+            resolution_base_revision=request.resolution_base_revision,
+            conflict_notes=request.conflict_notes,
         )
 
         if outcome.status == NOT_FOUND:
@@ -217,8 +235,46 @@ def create_app(
             )
 
         assert outcome.operation is not None
-        if outcome.status == NOTES_CONFLICT:
+        if outcome.status == NOTES_BAD_REQUEST:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "notes_bad_resolution",
+                    "message": (
+                        "冲突解决参数不合法：resolution_base_revision 必须早于"
+                        "服务端当前修订号，且 conflict_notes 需为触发冲突的原文"
+                    ),
+                    "current": OperationModel.from_operation(
+                        outcome.operation
+                    ).model_dump(),
+                },
+            )
+
+        if outcome.status == NOTES_UNREBASED:
+            # The reconciled draft was never rebased: it is missing disjoint
+            # edits other terminals committed.  Reject and hand back a fresh
+            # pre-rebased template; the database stays untouched.
             detail: dict = {
+                "error": "notes_unrebased",
+                "message": (
+                    "冲突解决草稿未重基到服务端全文：缺少其他终端已提交的"
+                    "非冲突改动，直接保存会覆盖这些改动。请基于下方重基模板"
+                    "（已包含远端非冲突改动并保留本终端原文）重新整理后再保存"
+                ),
+                "current": OperationModel.from_operation(outcome.operation).model_dump(),
+                "base_revision": request.base_revision,
+            }
+            if outcome.merge is not None:
+                detail["conflicts"] = [
+                    {"base": region.base, "mine": region.mine, "theirs": region.theirs}
+                    for region in outcome.merge.conflicts
+                ]
+            if outcome.rebase_template is not None:
+                detail["rebase_template"] = outcome.rebase_template
+            raise HTTPException(status_code=409, detail=detail)
+
+        if outcome.status == NOTES_CONFLICT:
+            detail = {
                 "error": "notes_conflict",
                 "message": (
                     "备注与其他终端的修改发生重叠冲突：请对照三方片段整理后再保存，"
@@ -232,8 +288,11 @@ def create_app(
                     {"base": region.base, "mine": region.mine, "theirs": region.theirs}
                     for region in outcome.merge.conflicts
                 ]
-                # Server's full current note, handy as a reconciliation starting point.
-                detail["server_notes"] = outcome.operation.notes
+                # Pre-rebased reconciliation starting point: it already carries
+                # the other terminal's disjoint edits, pre-filled with this
+                # terminal's own text in the conflict regions.
+                if outcome.rebase_template is not None:
+                    detail["rebase_template"] = outcome.rebase_template
             raise HTTPException(status_code=409, detail=detail)
 
         return NoteUpdateResponseModel(

@@ -208,6 +208,42 @@ describe('createHttpApi.updateNotes', () => {
       mine: '本地行\n',
       theirs: '服务端行\n',
     });
+    expect(conflict.unrebased).toBe(false);
+  });
+
+  it('409 notes_unrebased 携带重基模板并标记 unrebased', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse(409, {
+          detail: {
+            error: 'notes_unrebased',
+            message: '冲突解决草稿未重基到服务端全文',
+            current: {
+              scene_id: 'A-1',
+              client_op_id: opId,
+              notes: '第一行\nB第二行\nB第三行',
+              shot_number: 4,
+              created_at: '2026-09-15T00:00:00.000Z',
+              notes_revision: 1,
+            },
+            base_revision: 1,
+            conflicts: [
+              { base: '第二行\n', mine: 'A第二行\n', theirs: 'B第二行\n' },
+            ],
+            rebase_template: '第一行\nA第二行\nB第三行',
+          },
+        }),
+      ),
+    );
+
+    const err = await api.updateNotes(opId, body).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(NotesConflictError);
+    const conflict = err as NotesConflictError;
+    expect(conflict.unrebased).toBe(true);
+    expect(conflict.rebaseTemplate).toBe('第一行\nA第二行\nB第三行');
+    expect(conflict.current?.notes).toBe('第一行\nB第二行\nB第三行');
   });
 
   it('网络异常与 5xx 均映射为可重试错误（输入保留）', async () => {
