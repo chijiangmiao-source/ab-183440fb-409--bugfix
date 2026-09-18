@@ -251,6 +251,77 @@ def test_overlapping_edits_return_409_with_three_way_fragments_and_change_nothin
     assert resolved.json()["notes"] == "开场镜头\nA+B 合并后的备注\n结尾\n"
 
 
+def test_conflict_rebase_keeps_disjoint_remote_edit_from_same_save(api_server):
+    """409 后冲突解决草稿必须真正重基，不能静默还原远端非冲突改动。
+
+    复现路径：
+    * r0 = 第一行/第二行/第三行；
+    * B 在一次保存里同时修改与 A 重叠的第二行和不重叠的第三行 -> r1；
+    * A 从 r0 只改第二行 -> 第二行 409；
+    * A 依据 409 的有序脚手架重基（干净块原样、仅冲突块先取本端文字），
+      只把第二行整理为 A+B 后以 r1 为基础再次保存；
+    * 结果 r2 必须保留 B 在第三行的非冲突改动，而不是还原成 r0 文本。
+    """
+    base = api_server.base_url
+    op = issue_ok(base, "REBASE-N", notes="第一行\n第二行\n第三行")
+    op_id = op["client_op_id"]
+
+    # B wins r1, changing BOTH the overlapping second line and the disjoint
+    # third line in a single save.
+    b = patch_notes(base, op_id, 0, "第一行\nB第二行\nB第三行")
+    assert b.status_code == 200
+    assert b.json()["notes_revision"] == 1
+
+    # A saves the stale draft (still r0 text on line 3) editing only line 2.
+    clash = patch_notes(base, op_id, 0, "第一行\nA第二行\n第三行")
+    assert clash.status_code == 409
+    detail = clash.json()["detail"]
+
+    # The conflict is tight: only line 2, B's disjoint line-3 edit is NOT
+    # swallowed into the conflict fragment.
+    fragments = detail["conflicts"]
+    assert len(fragments) == 1
+    assert fragments[0] == {
+        "base": "第二行\n",
+        "mine": "A第二行\n",
+        "theirs": "B第二行\n",
+    }
+
+    blocks = detail["merge_blocks"]
+    assert blocks is not None
+    # The scaffold's server-side text reconstructs the current server note.
+    assert (
+        "".join(
+            blk["text"] if blk["type"] == "text" else blk["theirs"]
+            for blk in blocks
+        )
+        == "第一行\nB第二行\nB第三行"
+    )
+    # …and B's disjoint third line lives in a CLEAN block (not a conflict).
+    assert any(
+        blk["type"] == "text" and "B第三行" in blk["text"] for blk in blocks
+    )
+
+    # A rebases exactly like the web client: clean blocks verbatim, conflict
+    # blocks start from this terminal's text, then reconcile the conflict.
+    draft = "".join(
+        blk["text"] if blk["type"] == "text" else blk["mine"] for blk in blocks
+    )
+    assert draft == "第一行\nA第二行\nB第三行"  # B's third line already present
+    resolved_text = draft.replace("A第二行", "A+B第二行")
+
+    saved = patch_notes(base, op_id, 1, resolved_text)
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert body["notes_revision"] == 2
+    # B's non-conflicting third line survives; only line 2 was reconciled.
+    assert body["notes"] == "第一行\nA+B第二行\nB第三行"
+
+    history = revisions_of(base, op_id)
+    assert [r["revision"] for r in history] == [0, 1, 2]
+    assert history[2]["notes"] == "第一行\nA+B第二行\nB第三行"
+
+
 def test_identical_concurrent_updates_commit_once_and_safe_retry_doubles_nothing(
     api_server,
 ):

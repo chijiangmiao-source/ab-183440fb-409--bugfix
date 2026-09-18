@@ -86,8 +86,9 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
       setDraft(saveSucceeded());
     } catch (err) {
       if (err instanceof NotesConflictError) {
-        // 重叠改动：输入原样保留，基础修订号推进到服务端当前版本，
-        // 场记对照三方片段整理后再次保存。
+        // 重叠改动：草稿由服务端脚手架真正重基到服务端全文（干净区域含远端
+        // 非冲突改动，逐字保留；仅冲突区域填入本端文字待整理），基础修订号
+        // 推进到服务端当前版本，场记对照三方片段整理后再次保存。
         setDraft((state) =>
           saveNotesConflict(
             state,
@@ -99,6 +100,7 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
                     notes_revision: err.current.notes_revision,
                   }
                 : null,
+              mergeBlocks: err.mergeBlocks,
             },
             err.message,
           ),
@@ -235,6 +237,9 @@ export function NotesCell({ op, api, onSaved }: NotesCellProps) {
           <p className="error-text">
             与其他终端的修改在同一区域冲突，数据库未改动。请对照以下三方片段，在上方输入框
             整理出最终文本后再次保存（将以服务端 r{draft.baseRevision} 为基础）。
+          </p>
+          <p className="hint" data-testid="notes-rebased-hint">
+            输入框已并入其他终端的非冲突改动，只需整理下列冲突区域；非冲突内容不会被本次保存覆盖。
           </p>
           {draft.conflictSegments.map((segment, idx) => (
             <div className="conflict-segments" key={idx} data-testid="conflict-segment">

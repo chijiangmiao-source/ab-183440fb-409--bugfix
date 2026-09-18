@@ -92,6 +92,66 @@ def test_live_injected_failure_replays_original_number():
     assert retry.json()["replayed"] is True
 
 
+def test_live_conflict_resolution_keeps_disjoint_remote_edit():
+    """复现修复：409 后解决冲突的二次保存不得还原远端非冲突改动。
+
+    两个终端从 r0 编辑同一备注；B 在一次保存里同时改与 A 重叠的第二行以及
+    不重叠的第三行；A 收到 409 后按服务端脚手架真正重基，只整理第二行再保存。
+    最终 r2 必须同时包含 A 整理后的第二行与 B 的第三行。
+    """
+    scene = _scene()
+    issued = httpx.post(
+        f"{BASE_URL}/api/shot-numbers",
+        json={"scene_id": scene, "client_op_id": uuid.uuid4().hex,
+              "notes": "第一行\n第二行\n第三行"},
+        timeout=10.0,
+    )
+    assert issued.status_code == 201
+    op_id = issued.json()["client_op_id"]
+
+    def patch(base_revision: int, notes: str):
+        return httpx.patch(
+            f"{BASE_URL}/api/operations/{op_id}/notes",
+            json={"client_op_id": op_id, "base_revision": base_revision,
+                  "notes": notes},
+            timeout=10.0,
+        )
+
+    # B 在一次保存里同时改第二、三行 -> r1。
+    b = patch(0, "第一行\nB第二行\nB第三行")
+    assert b.status_code == 200
+    assert b.json()["notes_revision"] == 1
+
+    # A 仍持 r0 全文，只改第二行 -> 409。
+    clash = patch(0, "第一行\nA第二行\n第三行")
+    assert clash.status_code == 409
+    detail = clash.json()["detail"]
+    assert detail["current"]["notes_revision"] == 1
+    blocks = detail["merge_blocks"]
+    assert blocks, "409 应携带有序合并脚手架"
+    # 冲突仅限第二行，第三行是干净块里的远端非冲突改动。
+    assert detail["conflicts"] == [
+        {"base": "第二行\n", "mine": "A第二行\n", "theirs": "B第二行\n"}
+    ]
+    assert any(
+        blk["type"] == "text" and "B第三行" in blk["text"] for blk in blocks
+    )
+
+    # 前端重基：干净块原样、冲突块先取本端文字；再仅整理冲突的第二行。
+    draft = "".join(
+        blk["text"] if blk["type"] == "text" else blk["mine"] for blk in blocks
+    )
+    resolved = draft.replace("A第二行", "A+B第二行")
+    saved = patch(1, resolved)
+    assert saved.status_code == 200, saved.text
+    body = saved.json()
+    assert body["notes_revision"] == 2
+    assert body["notes"] == "第一行\nA+B第二行\nB第三行"
+
+    current = httpx.get(f"{BASE_URL}/api/operations/{op_id}", timeout=10.0)
+    assert current.json()["notes"] == "第一行\nA+B第二行\nB第三行"
+
+
 def test_live_note_revisions_merge_conflict_and_sequence():
     """备注可修订的完整现场流（对持久库安全，场景/标识每次唯一）。
 

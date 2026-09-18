@@ -234,6 +234,13 @@ def create_app(
                 ]
                 # Server's full current note, handy as a reconciliation starting point.
                 detail["server_notes"] = outcome.operation.notes
+                # Ordered scaffold of the attempted three-way merge: clean
+                # (already-merged) text blocks interleaved with conflict
+                # blocks that carry the same three fragments.  A client rebases
+                # its draft by taking every clean block verbatim and filling in
+                # only the conflict blocks, so non-conflicting remote edits can
+                # never be reverted by a stale draft saved against the new base.
+                detail["merge_blocks"] = outcome.merge.as_scaffold()
             raise HTTPException(status_code=409, detail=detail)
 
         return NoteUpdateResponseModel(

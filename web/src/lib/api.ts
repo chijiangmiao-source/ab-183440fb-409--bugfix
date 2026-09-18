@@ -2,6 +2,7 @@ import type {
   IssueRequestBody,
   IssueResponse,
   IssuedOperation,
+  MergeBlock,
   NoteRevision,
   NoteUpdateRequestBody,
   NoteUpdateResponse,
@@ -20,14 +21,17 @@ export class ConflictError extends Error {
 }
 
 /**
- * 409：备注修订与其他终端的改动重叠。携带服务端当前备注、修订号与三方片段，
- * 场记整理文本后用新的基础修订号再次保存即可；输入不会因此丢失。
+ * 409：备注修订与其他终端的改动重叠。携带服务端当前备注、修订号、三方片段与
+ * 有序合并脚手架（mergeBlocks），场记整理文本后用新的基础修订号再次保存即可；
+ * 输入不会因此丢失。
  */
 export class NotesConflictError extends Error {
   readonly current: IssuedOperation | null;
   readonly baseRevision: number | null;
   readonly conflicts: ThreeWaySegment[];
   readonly serverNotes: string | null;
+  /** 服务端复算的三方合并有序脚手架（text/conflict 块），用于真正重基草稿。 */
+  readonly mergeBlocks: MergeBlock[] | null;
 
   constructor(
     message: string,
@@ -35,6 +39,7 @@ export class NotesConflictError extends Error {
     conflicts: ThreeWaySegment[],
     baseRevision: number | null,
     serverNotes: string | null,
+    mergeBlocks: MergeBlock[] | null,
   ) {
     super(message);
     this.name = 'NotesConflictError';
@@ -42,6 +47,7 @@ export class NotesConflictError extends Error {
     this.conflicts = conflicts;
     this.baseRevision = baseRevision;
     this.serverNotes = serverNotes;
+    this.mergeBlocks = mergeBlocks;
   }
 }
 
@@ -84,6 +90,22 @@ interface ErrorDetail {
   conflicts?: ThreeWaySegment[];
   base_revision?: number;
   server_notes?: string;
+  merge_blocks?: MergeBlock[];
+}
+
+function isMergeBlocks(value: unknown): value is MergeBlock[] {
+  if (!Array.isArray(value)) return false;
+  return value.every((raw) => {
+    if (raw === null || typeof raw !== 'object') return false;
+    const block = raw as Record<string, unknown>;
+    if (block.type === 'text') return typeof block.text === 'string';
+    if (block.type === 'conflict') {
+      return ['base', 'mine', 'theirs'].every(
+        (key) => typeof block[key] === 'string',
+      );
+    }
+    return false;
+  });
 }
 
 async function parseErrorBody(res: Response): Promise<ErrorDetail> {
@@ -99,6 +121,7 @@ async function parseErrorBody(res: Response): Promise<ErrorDetail> {
         conflicts: Array.isArray(detail.conflicts) ? detail.conflicts : [],
         base_revision: typeof detail.base_revision === 'number' ? detail.base_revision : null,
         server_notes: typeof detail.server_notes === 'string' ? detail.server_notes : null,
+        merge_blocks: isMergeBlocks(detail.merge_blocks) ? detail.merge_blocks : undefined,
       };
     }
     if (Array.isArray(detail) && detail.length > 0) {
@@ -187,6 +210,7 @@ export function createHttpApi(baseUrl = ''): ShotNumberApi {
           detail.conflicts ?? [],
           detail.base_revision ?? null,
           detail.server_notes ?? null,
+          detail.merge_blocks ?? null,
         );
       }
       if (res.status >= 500) {

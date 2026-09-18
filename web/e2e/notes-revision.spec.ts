@@ -139,6 +139,60 @@ test('重叠编辑返回 409：展示三方片段、输入保留，整理后再�
   await expect(panel).toHaveCount(0);
 });
 
+test('冲突解决：二次保存保留对方同次保存里的非冲突改动（409 后真正重基）', async ({
+  page,
+  request,
+}) => {
+  // 复现修复：B 在一次保存里同时改与 A 重叠的第二行和不重叠的第三行；
+  // A 收到 409 后草稿必须真正重基到服务端全文，只整理第二行再保存时，
+  // B 的第三行不得被 A 旧草稿里的 r0 文本静默还原。
+  await page.goto('/');
+  await issueShot(page, 'E2E-NOTES-REBASE', '第一行\n第二行\n第三行');
+
+  const row = page.getByTestId('scene-op-row').first();
+
+  // 终端 A（浏览器）从 r0 只改第二行，第三行仍是 r0 文本，先不保存。
+  await row.getByTestId('edit-notes-button').click();
+  const draft = row.getByTestId('notes-draft-input');
+  await draft.fill('第一行\nA第二行\n第三行');
+
+  // 终端 B（直接 API）一次保存同时改第二、三行 -> r1。
+  const listing = await request.get('/api/scenes/E2E-NOTES-REBASE/operations');
+  const ops = (await listing.json()) as Array<{ client_op_id: string }>;
+  const bResp = await request.patch(`/api/operations/${ops[0].client_op_id}/notes`, {
+    data: {
+      client_op_id: ops[0].client_op_id,
+      base_revision: 0,
+      notes: '第一行\nB第二行\nB第三行',
+    },
+  });
+  expect(bResp.status()).toBe(200);
+
+  // A 保存 -> 第二行 409，冲突面板出现。
+  await row.getByTestId('save-notes-button').click();
+  const panel = row.getByTestId('notes-conflict-panel');
+  await expect(panel).toBeVisible();
+
+  // 关键：草稿已真正重基——冲突的第二行保留 A 的输入，非冲突的第三行已是 B 的文本，
+  // 基础修订号推进到 r1（而不是“旧草稿 + r1”）。
+  await expect(draft).toHaveValue('第一行\nA第二行\nB第三行');
+  await expect(row).toContainText('基础修订号 r1');
+
+  // 场记只在冲突片段内把第二行整理为 A+B，第三行原样保留。
+  await draft.fill('第一行\nA+B第二行\nB第三行');
+  await row.getByTestId('save-notes-button').click();
+
+  // 成为 r2，且 B 在第三行的非冲突改动被保留，没有还原成 r0 的“第三行”。
+  await expect(row.getByTestId('notes-revision')).toHaveText('r2');
+  await expect(panel).toHaveCount(0);
+  const finalResp = await request.get(
+    `/api/operations/${ops[0].client_op_id}`,
+  );
+  const finalOp = await finalResp.json();
+  expect(finalOp.notes).toBe('第一行\nA+B第二行\nB第三行');
+  expect(finalOp.notes_revision).toBe(2);
+});
+
 test('保存时网络失败保留输入，恢复后重试成功', async ({ page }) => {
   await page.goto('/');
   await issueShot(page, 'E2E-NOTES-NET', '网络测试原备注');

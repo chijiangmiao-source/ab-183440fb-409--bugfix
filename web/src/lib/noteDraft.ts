@@ -1,4 +1,5 @@
-import type { ThreeWaySegment } from './types';
+import { rebasedDraftFromBlocks } from './rebase';
+import type { MergeBlock, ThreeWaySegment } from './types';
 
 /**
  * 行内备注编辑的草稿状态机（纯函数，便于单测）。
@@ -11,6 +12,11 @@ import type { ThreeWaySegment } from './types';
  *
  * 关键约定：网络失败与 409 冲突都不会清空 draft —— 场记整理服务端与本地
  * 文本后必须能用同一份输入再次保存。
+ *
+ * 冲突时 draft 不是“旧草稿原样保留 + 推进基础号”：那样会以当前修订号直存
+ * 一份不含远端非冲突改动的旧全文，静默覆盖其他终端的不相交修改。相反，
+ * 409 携带的服务端有序合并脚手架（mergeBlocks）会把 draft 真正重基到服务端
+ * 全文——干净区域（含远端改动）逐字保留，仅冲突区域先填入本端文字待整理。
  */
 export type NoteDraftMode = 'idle' | 'editing' | 'saving' | 'conflict';
 
@@ -24,11 +30,15 @@ export interface NoteDraftState {
   /** 冲突时服务端当前文本与修订号（便于“先填入服务端文本再整理”）。 */
   serverNotes: string | null;
   serverRevision: number | null;
+  /** 冲突时服务端复算的有序合并脚手架；draft 据此重基，干净块不可被旧草稿还原。 */
+  mergeBlocks: MergeBlock[] | null;
 }
 
 export interface NoteConflictPayload {
   conflicts: ThreeWaySegment[];
   current: { notes: string; notes_revision: number } | null;
+  /** 服务端 409 中的有序合并脚手架；缺失时退化为以服务端当前全文为草稿。 */
+  mergeBlocks?: MergeBlock[] | null;
 }
 
 export function idleDraft(): NoteDraftState {
@@ -40,6 +50,7 @@ export function idleDraft(): NoteDraftState {
     conflictSegments: [],
     serverNotes: null,
     serverRevision: null,
+    mergeBlocks: null,
   };
 }
 
@@ -91,17 +102,22 @@ export function saveNotesConflict(
   message: string,
 ): NoteDraftState {
   if (state.mode !== 'saving') return state;
-  // 重叠冲突：本地输入原样保留；基础修订号推进到服务端当前版本，
-  // 场记对照三方片段整理后再次保存。
+  const serverNotes = payload.current?.notes ?? null;
+  const serverRevision = payload.current?.notes_revision ?? null;
+  // 重叠冲突：把草稿真正重基到服务端当前全文——干净区域（包含其他终端的
+  // 非冲突改动）逐字保留，仅冲突区域先填入本端文字等待整理。基础修订号随之
+  // 推进到服务端当前版本。若服务端未给脚手架（旧版本混用），退化为直接以
+  // 服务端当前全文为草稿，同样不会覆盖任何远端改动。
   return {
     ...state,
     mode: 'conflict',
     error: message,
     conflictSegments: payload.conflicts,
-    serverNotes: payload.current?.notes ?? null,
-    serverRevision: payload.current?.notes_revision ?? null,
-    baseRevision:
-      payload.current?.notes_revision ?? state.baseRevision,
+    serverNotes,
+    serverRevision,
+    mergeBlocks: payload.mergeBlocks ?? null,
+    baseRevision: serverRevision ?? state.baseRevision,
+    draft: rebasedDraftFromBlocks(payload.mergeBlocks, serverNotes ?? state.draft),
   };
 }
 

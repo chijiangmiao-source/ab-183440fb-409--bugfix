@@ -191,6 +191,11 @@ describe('createHttpApi.updateNotes', () => {
             conflicts: [
               { base: '原行\n', mine: '本地行\n', theirs: '服务端行\n' },
             ],
+            merge_blocks: [
+              { type: 'text', text: '共同前缀\n' },
+              { type: 'conflict', base: '原行\n', mine: '本地行\n', theirs: '服务端行\n' },
+              { type: 'text', text: '服务端独有结尾\n' },
+            ],
           },
         }),
       ),
@@ -208,6 +213,39 @@ describe('createHttpApi.updateNotes', () => {
       mine: '本地行\n',
       theirs: '服务端行\n',
     });
+    expect(conflict.mergeBlocks).toEqual([
+      { type: 'text', text: '共同前缀\n' },
+      { type: 'conflict', base: '原行\n', mine: '本地行\n', theirs: '服务端行\n' },
+      { type: 'text', text: '服务端独有结尾\n' },
+    ]);
+  });
+
+  it('409 缺少 merge_blocks 时回退为 null（兼容旧服务端）', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse(409, {
+          detail: {
+            error: 'notes_conflict',
+            message: '备注冲突',
+            current: {
+              scene_id: 'A-1',
+              client_op_id: opId,
+              notes: '服务端文本',
+              shot_number: 4,
+              created_at: '2026-09-15T00:00:00.000Z',
+              notes_revision: 1,
+            },
+            conflicts: [],
+          },
+        }),
+      ),
+    );
+
+    const err = await api.updateNotes(opId, body).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(NotesConflictError);
+    expect((err as NotesConflictError).mergeBlocks).toBeNull();
   });
 
   it('网络异常与 5xx 均映射为可重试错误（输入保留）', async () => {
